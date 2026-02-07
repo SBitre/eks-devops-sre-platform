@@ -1,0 +1,229 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: devops-sre-platform/api
+  EKS_CLUSTER: devops-sre-platform
+  NAMESPACE: devops-platform
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write
+
+jobs:
+  # ─────────────────────────────────────────────────────
+  # Stage 1: Test & Lint
+  # ─────────────────────────────────────────────────────
+  test:
+    name: Test & Lint
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: test_db
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: testpass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install ruff mypy safety bandit
+
+      - name: Lint with Ruff
+        run: ruff check app/ --output-format=github
+
+      - name: Type check with MyPy
+        run: mypy app/ --ignore-missing-imports
+        continue-on-error: true
+
+      - name: Security scan (Bandit)
+        run: bandit -r app/ -f json -o bandit-report.json || true
+
+      - name: Dependency vulnerability scan
+        run: safety check -r requirements.txt --output json > safety-report.json || true
+
+      - name: Run tests
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:testpass@localhost:5432/test_db
+        run: pytest tests/ -v --tb=short --junitxml=test-results.xml
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: |
+            test-results.xml
+            bandit-report.json
+            safety-report.json
+
+  # ─────────────────────────────────────────────────────
+  # Stage 2: Build & Push Docker Image
+  # ─────────────────────────────────────────────────────
+  build:
+    name: Build & Push
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-results.sarif"
+
+  # ─────────────────────────────────────────────────────
+  # Stage 3: Deploy to EKS
+  # ─────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to EKS
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+      - name: Deploy to EKS
+        run: |
+          IMAGE="${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
+
+          # Update deployment image
+          kubectl set image deployment/devops-platform \
+            api=$IMAGE \
+            -n ${{ env.NAMESPACE }}
+
+          # Wait for rollout
+          kubectl rollout status deployment/devops-platform \
+            -n ${{ env.NAMESPACE }} \
+            --timeout=300s
+
+      - name: Verify deployment
+        run: |
+          kubectl get pods -n ${{ env.NAMESPACE }} -l app=devops-platform
+          kubectl get svc -n ${{ env.NAMESPACE }}
+
+      - name: Run smoke tests
+        run: |
+          # Get the ALB endpoint
+          ENDPOINT=$(kubectl get ingress devops-platform-ingress \
+            -n ${{ env.NAMESPACE }} \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+          # Health check
+          curl -sf "https://$ENDPOINT/healthz" || exit 1
+          echo "✅ Health check passed"
+
+          # API smoke test
+          curl -sf "https://$ENDPOINT/docs" || exit 1
+          echo "✅ API docs accessible"
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "⚠️ Deployment failed, rolling back..."
+          kubectl rollout undo deployment/devops-platform -n ${{ env.NAMESPACE }}
+          kubectl rollout status deployment/devops-platform -n ${{ env.NAMESPACE }} --timeout=300s
+
+  # ─────────────────────────────────────────────────────
+  # Stage 4: Post-deploy notifications
+  # ─────────────────────────────────────────────────────
+  notify:
+    name: Notify
+    needs: [build, deploy]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Deployment notification
+        run: |
+          if [ "${{ needs.deploy.result }}" == "success" ]; then
+            echo "✅ Deployment successful: ${{ github.sha }}"
+          else
+            echo "❌ Deployment failed: ${{ github.sha }}"
+          fi
